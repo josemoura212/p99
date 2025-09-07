@@ -1,20 +1,18 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::net::TcpListener;
-use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
-use tower_http::{
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    trace::TraceLayer,
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
-use tracing::{Level, info};
+use tokio::net::TcpListener;
+use tracing::info;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -39,24 +37,56 @@ struct AppState {
     breaker_b: Arc<Breaker>,
     strategy: Arc<RouteStrategy>,
     idem: Cache<String, ()>,
+    stats: Arc<Mutex<PaymentStats>>,
+}
+
+#[derive(Default)]
+struct PaymentStats {
+    default: ProcessorStats,
+    fallback: ProcessorStats,
+}
+
+#[derive(Default)]
+struct ProcessorStats {
+    total_requests: u64,
+    total_amount: f64,
 }
 
 #[derive(Deserialize)]
 struct PayIn {
-    idempotency_key: String,
-    amount: i64,
-    #[serde(default)]
-    currency: Option<String>,
-    #[serde(default)]
-    metadata: serde_json::Value,
+    #[serde(rename = "correlationId")]
+    correlation_id: String, // Campo da rinha
+    amount: f64,
+}
+
+#[derive(Deserialize)]
+struct TransacaoIn {
+    valor: i64,
+    tipo: String,
+    descricao: String,
+}
+
+#[derive(Serialize)]
+struct TransacaoOut {
+    limite: i64,
+    saldo: i64,
 }
 
 #[derive(Serialize)]
 struct PayOut {
-    processor: String,
-    status: String,
-    latency_ms: u64,
-    echo: serde_json::Value,
+    message: String, // Ajustado para rinha
+}
+
+#[derive(Serialize)]
+struct PaymentSummary {
+    default: ProcessorSummary,
+    fallback: ProcessorSummary,
+}
+
+#[derive(Serialize)]
+struct ProcessorSummary {
+    total_requests: u64,
+    total_amount: f64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -115,12 +145,15 @@ async fn main() -> anyhow::Result<()> {
         breaker_b,
         strategy,
         idem,
+        stats: Arc::new(Mutex::new(PaymentStats::default())),
     };
 
     // router
     let prom_handle_route = prom_handle.clone();
     let app = Router::new()
         .route("/payments", post(pay))
+        .route("/payments-summary", get(payments_summary))
+        .route("/clientes/{id}/transacoes", post(transacao))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
         .route(
@@ -130,17 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 async move { h.render() }
             }),
         )
-        .with_state(state.clone())
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http())
-                .layer(PropagateRequestIdLayer::x_request_id())
-                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-                .layer(ConcurrencyLimitLayer::new(state.cfg.concurrency_limit))
-                .layer(TimeoutLayer::new(Duration::from_millis(
-                    state.cfg.request_timeout_ms,
-                ))),
-        );
+        .with_state(state.clone());
 
     // axum 0.8 -> TcpListener + axum::serve
     let addr: SocketAddr = format!("0.0.0.0:{}", state.cfg.port).parse()?;
@@ -169,27 +192,30 @@ async fn pay(
     }
 
     // idempotência básica
-    let key = format!("idemp:{}", body.idempotency_key);
+    let key = format!("idemp:{}", body.correlation_id);
     if st.idem.get(&key).is_some() {
         return Err((
             StatusCode::CONFLICT,
-            "duplicate idempotency_key (ttl)".into(),
+            "duplicate correlation_id (ttl)".into(),
         ));
     }
 
     // seleção prim/sec com breaker
-    let (prim, sec, prim_brk, sec_brk) = if st.strategy.pick_a_first(&st.breaker_a, &st.breaker_b) {
-        (&st.up_a, &st.up_b, &st.breaker_a, &st.breaker_b)
+    let (prim, sec, prim_brk) = if st.strategy.pick_a_first(&st.breaker_a, &st.breaker_b) {
+        (&st.up_a, &st.up_b, &st.breaker_a)
     } else {
-        (&st.up_b, &st.up_a, &st.breaker_b, &st.breaker_a)
+        (&st.up_b, &st.up_a, &st.breaker_b)
     };
 
-    // payload para upstream
+    // payload para upstream (formato da rinha)
+    let requested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let req_body = serde_json::json!({
+        "correlationId": body.correlation_id,
         "amount": body.amount,
-        "currency": body.currency.as_deref().unwrap_or("BRL"),
-        "metadata": body.metadata,
-        "idempotency_key": body.idempotency_key,
+        "requestedAt": format!("2025-09-07T{:02}:00:00.000Z", requested_at % 86400 / 3600),
     });
 
     let start = std::time::Instant::now();
@@ -199,39 +225,64 @@ async fn pay(
 
     let result = if prim_brk.is_open() {
         st.strategy.note_skip_primary();
-        sec.request(&st.cfg, &req_body).await
+        sec.clone()
+            .request(Arc::clone(&st.cfg), req_body.clone())
+            .await
     } else {
-        let p = prim.request(&st.cfg, &req_body);
-        tokio::select! {
-            res = p => res,
+        let cfg_clone = Arc::clone(&st.cfg);
+        let req_body_clone = req_body.clone();
+        let prim_clone = prim.clone();
+        let mut p_handle =
+            tokio::spawn(async move { prim_clone.request(cfg_clone, req_body_clone).await });
+        let res = tokio::select! {
+            res = &mut p_handle => res,
             _ = tokio::time::sleep(hedge_delay) => {
-                if !prim_brk.is_open() {
-                    let s = sec.request(&st.cfg, &req_body);
-                    tokio::select! {
-                        r1 = s => r1,
-                        r2 = p => r2,
-                    }
-                } else {
-                    sec.request(&st.cfg, &req_body).await
+                let cfg_clone2 = Arc::clone(&st.cfg);
+                let req_body_clone2 = req_body.clone();
+                let sec_clone = sec.clone();
+                let mut s_handle = tokio::spawn(async move { sec_clone.request(cfg_clone2, req_body_clone2).await });
+                tokio::select! {
+                    res = &mut s_handle => res,
+                    res = &mut p_handle => res,
                 }
             }
+        };
+        match res {
+            Ok(r) => r,
+            Err(_) => Err((
+                "unknown".into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "task panicked".into(),
+            )),
         }
     };
 
     let elapsed = start.elapsed().as_millis() as u64;
-    metrics::histogram!("payments_latency_ms", elapsed as f64);
+    metrics::histogram!("payments_latency_ms").record(elapsed as f64);
 
     match result {
-        Ok((proc_name, echo)) => {
-            st.idem.insert(key, ());
-            metrics::increment_counter!("payments_ok");
+        Ok((proc_name, _echo)) => {
+            st.idem.insert(key.clone(), ());
+
+            // Atualizar estatísticas
+            {
+                let mut stats = st.stats.lock().unwrap();
+                if proc_name == "A" {
+                    stats.default.total_requests += 1;
+                    stats.default.total_amount += body.amount;
+                    st.breaker_a.on_success();
+                } else {
+                    stats.fallback.total_requests += 1;
+                    stats.fallback.total_amount += body.amount;
+                    st.breaker_b.on_success();
+                }
+            }
+
+            metrics::counter!("payments_ok").increment(1);
             Ok((
                 StatusCode::OK,
                 Json(PayOut {
-                    processor: proc_name,
-                    status: "approved".into(),
-                    latency_ms: elapsed,
-                    echo,
+                    message: "payment processed successfully".into(),
                 }),
             ))
         }
@@ -241,8 +292,163 @@ async fn pay(
             } else {
                 st.breaker_b.on_failure();
             }
-            metrics::increment_counter!("payments_err", "code" => code.as_str());
+            metrics::counter!("payments_err", "code" => code.as_u16().to_string()).increment(1);
             Err((code, msg))
         }
     }
+}
+
+async fn transacao(
+    State(st): State<AppState>,
+    Path(cliente_id): Path<String>,
+    Json(body): Json<TransacaoIn>,
+) -> Result<(StatusCode, Json<TransacaoOut>), (StatusCode, String)> {
+    // Validação básica do cliente (simplificada para Rinha)
+    let cliente_id_num: i64 = match cliente_id.parse() {
+        Ok(id) if id >= 1 && id <= 5 => id,
+        _ => return Err((StatusCode::NOT_FOUND, "cliente not found".into())),
+    };
+
+    // Validações da Rinha
+    if body.descricao.is_empty() || body.descricao.len() > 10 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid descricao".into()));
+    }
+
+    if body.tipo != "c" && body.tipo != "d" {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid tipo".into()));
+    }
+
+    if body.valor <= 0 {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "invalid valor".into()));
+    }
+
+    // Simulação de limite e saldo (valores fixos por cliente para simplificar)
+    let limite = match cliente_id_num {
+        1 => 100000,
+        2 => 80000,
+        3 => 1000000,
+        4 => 10000000,
+        5 => 500000,
+        _ => 0,
+    };
+
+    let mut saldo = 0; // Em um sistema real, isso viria do banco de dados
+
+    // Aplicar transação
+    if body.tipo == "d" {
+        saldo -= body.valor;
+        if saldo < -limite {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "limite exceeded".into()));
+        }
+    } else {
+        saldo += body.valor;
+    }
+
+    // Aqui deveria salvar no banco de dados, mas para a Rinha vamos simular
+    // e usar o upstream mock para processamento
+
+    // Chamar upstream para processamento (usando o mesmo mecanismo)
+    let correlation_id = format!(
+        "transacao-{}-{}",
+        cliente_id,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+
+    let req_body = serde_json::json!({
+        "correlationId": correlation_id,
+        "amount": body.valor as f64,
+        "clienteId": cliente_id_num,
+        "tipo": body.tipo,
+        "descricao": body.descricao
+    });
+
+    // Usar o mesmo mecanismo de upstream da função pay
+    let (prim, sec, prim_brk) = if st.strategy.pick_a_first(&st.breaker_a, &st.breaker_b) {
+        (&st.up_a, &st.up_b, &st.breaker_a)
+    } else {
+        (&st.up_b, &st.up_a, &st.breaker_b)
+    };
+
+    let result = if prim_brk.is_open() {
+        st.strategy.note_skip_primary();
+        sec.clone()
+            .request(Arc::clone(&st.cfg), req_body.clone())
+            .await
+    } else {
+        let cfg_clone = Arc::clone(&st.cfg);
+        let req_body_clone = req_body.clone();
+        let prim_clone = prim.clone();
+        let mut p_handle =
+            tokio::spawn(async move { prim_clone.request(cfg_clone, req_body_clone).await });
+        let res = tokio::select! {
+            res = &mut p_handle => res,
+            _ = tokio::time::sleep(Duration::from_millis(st.cfg.hedge_delay_ms)) => {
+                let cfg_clone2 = Arc::clone(&st.cfg);
+                let req_body_clone2 = req_body.clone();
+                let sec_clone = sec.clone();
+                let mut s_handle = tokio::spawn(async move { sec_clone.request(cfg_clone2, req_body_clone2).await });
+                tokio::select! {
+                    res = &mut s_handle => res,
+                    res = &mut p_handle => res,
+                }
+            }
+        };
+        match res {
+            Ok(r) => r,
+            Err(_) => Err((
+                "unknown".into(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "task panicked".into(),
+            )),
+        }
+    };
+
+    match result {
+        Ok((proc_name, _echo)) => {
+            // Atualizar estatísticas
+            {
+                let mut stats = st.stats.lock().unwrap();
+                if proc_name == "A" {
+                    stats.default.total_requests += 1;
+                    stats.default.total_amount += body.valor as f64;
+                    st.breaker_a.on_success();
+                } else {
+                    stats.fallback.total_requests += 1;
+                    stats.fallback.total_amount += body.valor as f64;
+                    st.breaker_b.on_success();
+                }
+            }
+
+            metrics::counter!("transacoes_ok").increment(1);
+            Ok((StatusCode::OK, Json(TransacaoOut { limite, saldo })))
+        }
+        Err((proc_name, code, msg)) => {
+            if proc_name == "A" {
+                st.breaker_a.on_failure();
+            } else {
+                st.breaker_b.on_failure();
+            }
+            metrics::counter!("transacoes_err", "code" => code.as_u16().to_string()).increment(1);
+            Err((code, msg))
+        }
+    }
+}
+
+async fn payments_summary(
+    State(st): State<AppState>,
+) -> Result<Json<PaymentSummary>, (StatusCode, String)> {
+    let stats = st.stats.lock().unwrap();
+    Ok(Json(PaymentSummary {
+        default: ProcessorSummary {
+            total_requests: stats.default.total_requests,
+            total_amount: stats.default.total_amount,
+        },
+        fallback: ProcessorSummary {
+            total_requests: stats.fallback.total_requests,
+            total_amount: stats.fallback.total_amount,
+        },
+    }))
 }

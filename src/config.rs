@@ -1,5 +1,6 @@
 use anyhow::Context;
 
+#[allow(unused)]
 #[derive(Clone, Debug)]
 pub struct Cfg {
     pub port: u16,

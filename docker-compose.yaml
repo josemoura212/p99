@@ -1,5 +1,29 @@
-version: "3.9"
 services:
+  # Payment processors serão simulados localmente por enquanto
+  # payment-processor-default:
+  #   image: zanfranceschi/rinha-de-backend-2025-payment-processor:latest
+  #   environment:
+  #     - PROCESSOR_TYPE=default
+  #   networks:
+  #     - payment-processor
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.2"
+  #         memory: "100M"
+
+  # payment-processor-fallback:
+  #   image: zanfranceschi/rinha-de-backend-2025-payment-processor:latest
+  #   environment:
+  #     - PROCESSOR_TYPE=fallback
+  #   networks:
+  #     - payment-processor
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.2"
+  #         memory: "100M"
+
   lb:
     image: nginx:1.27-alpine
     volumes:
@@ -9,36 +33,48 @@ services:
     depends_on:
       - api-1
       - api-2
+    networks:
+      - payment-processor
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "600M"
+          cpus: "0.3"
+          memory: "50M"
 
   api-1: &api
     build: .
     environment:
       PORT: "9999"
-      UPSTREAM_A_URL: "http://processor-a:8080"
-      UPSTREAM_B_URL: "http://processor-b:8081"
-      UPSTREAM_PAY_PATH: "/api/pay"
-      AUTH_HEADER_NAME: "Authorization"
-      AUTH_HEADER_VALUE: "Bearer 123"
-      REQUEST_TIMEOUT_MS: "120"
+      UPSTREAM_A_URL: "http://httpbin.org/post"  # Mock que aceita POST
+      UPSTREAM_B_URL: "http://httpbin.org/post"  # Mock que aceita POST
+      UPSTREAM_PAY_PATH: ""
+      AUTH_HEADER_NAME: ""  # Remover autenticação temporariamente
+      AUTH_HEADER_VALUE: ""
+      REQUEST_TIMEOUT_MS: "5000"  # Aumentar timeout
       HEDGE_DELAY_MS: "40"
       CONCURRENCY_LIMIT: "1024"
       CB_FAIL_RATE: "0.25"
       CB_MIN_SAMPLES: "50"
       CB_OPEN_SECS: "2"
+    # depends_on:
+    #   - payment-processor-default
+    #   - payment-processor-fallback
+    networks:
+      - payment-processor
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "450M"
-    networks: [ default ]
+          cpus: "0.4"
+          memory: "100M"
 
   api-2:
     <<: *api
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"
+          memory: "100M"
 
 networks:
-  default: {}
+  payment-processor:
+    driver: bridge
