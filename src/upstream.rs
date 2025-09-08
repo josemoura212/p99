@@ -49,9 +49,8 @@ impl UpstreamClient {
         let url = format!("{base}{}", cfg.pay_path);
 
         let mut req = self.http.post(&url).json(&body);
-        if let (Some(hn), Some(hv)) = (&cfg.auth_header_name, &cfg.auth_header_value) {
-            req = req.header(hn, hv);
-        }
+        // Sempre usar X-Rinha-Token para payment processors oficiais
+        req = req.header("X-Rinha-Token", "123");
 
         match req.send().await {
             Ok(resp) => {

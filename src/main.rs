@@ -91,7 +91,6 @@ struct ProcessorSummary {
     total_amount: f64,
 }
 
-
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct PaymentsSummaryQuery {
@@ -141,10 +140,10 @@ async fn main() -> anyhow::Result<()> {
     // estratégia de roteamento
     let strategy = Arc::new(RouteStrategy::new());
 
-    // cache idempotente TTL curto
+    // cache idempotente TTL curto - otimizado para alta performance
     let idem = Cache::builder()
-        .max_capacity(1_000_000)
-        .time_to_live(Duration::from_secs(60))
+        .max_capacity(500_000) // Reduzido para melhor performance
+        .time_to_live(Duration::from_secs(30)) // TTL reduzido
         .build();
 
     let state = AppState {
@@ -202,9 +201,9 @@ async fn pay(
         }
     }
 
-    // idempotência básica
-    let key = format!("idemp:{}", body.correlation_id);
-    if st.idem.get(&key).is_some() {
+    // idempotência básica - otimizada para evitar alocação de string
+    let key = body.correlation_id.as_str();
+    if st.idem.get(key).is_some() {
         return Err((
             StatusCode::CONFLICT,
             "duplicate correlation_id (ttl)".into(),
@@ -218,51 +217,39 @@ async fn pay(
         (&st.up_b, &st.up_a, &st.breaker_b)
     };
 
-    // payload para upstream (formato da rinha)
-    let now = std::time::SystemTime::now();
-    let requested_at = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
+    // payload para upstream (formato da rinha) - otimizado
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let req_body = serde_json::json!({
-        "correlationId": uuid::Uuid::new_v4().to_string(),
+        "correlationId": correlation_id,
         "amount": body.amount,
         "requestedAt": requested_at,
     });
 
     let start = std::time::Instant::now();
 
-    // Hedge simples: dispara sec depois de um delay se prim não retornou
-    let hedge_delay = Duration::from_millis(st.cfg.hedge_delay_ms);
-
+    // Hedge otimizado: tenta primary primeiro, só faz hedge se necessário
     let result = if prim_brk.is_open() {
         st.strategy.note_skip_primary();
         sec.clone()
             .request(Arc::clone(&st.cfg), req_body.clone())
             .await
     } else {
-        let cfg_clone = Arc::clone(&st.cfg);
-        let req_body_clone = req_body.clone();
-        let prim_clone = prim.clone();
-        let mut p_handle =
-            tokio::spawn(async move { prim_clone.request(cfg_clone, req_body_clone).await });
-        let res = tokio::select! {
-            res = &mut p_handle => res,
-            _ = tokio::time::sleep(hedge_delay) => {
-                let cfg_clone2 = Arc::clone(&st.cfg);
-                let req_body_clone2 = req_body.clone();
-                let sec_clone = sec.clone();
-                let mut s_handle = tokio::spawn(async move { sec_clone.request(cfg_clone2, req_body_clone2).await });
-                tokio::select! {
-                    res = &mut s_handle => res,
-                    res = &mut p_handle => res,
-                }
+        // Tenta primary com timeout reduzido
+        let primary_timeout = Duration::from_millis(st.cfg.hedge_delay_ms);
+        match tokio::time::timeout(
+            primary_timeout,
+            prim.clone().request(Arc::clone(&st.cfg), req_body.clone()),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(result), // Primary conseguiu
+            _ => {
+                // Primary falhou ou demorou, tenta secondary
+                sec.clone()
+                    .request(Arc::clone(&st.cfg), req_body.clone())
+                    .await
             }
-        };
-        match res {
-            Ok(r) => r,
-            Err(_) => Err((
-                "unknown".into(),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "task panicked".into(),
-            )),
         }
     };
 
@@ -271,7 +258,7 @@ async fn pay(
 
     match result {
         Ok((proc_name, _echo)) => {
-            st.idem.insert(key.clone(), ());
+            st.idem.insert(key.to_string(), ());
 
             // Atualizar estatísticas
             {

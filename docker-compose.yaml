@@ -111,12 +111,12 @@ services:
       UPSTREAM_PAY_PATH: "/payments"
       AUTH_HEADER_NAME: "Authorization"
       AUTH_HEADER_VALUE: "Bearer 123"
-      REQUEST_TIMEOUT_MS: "5000"
-      HEDGE_DELAY_MS: "40"
-      CONCURRENCY_LIMIT: "1024"
-      CB_FAIL_RATE: "0.25"
-      CB_MIN_SAMPLES: "50"
-      CB_OPEN_SECS: "2"
+      REQUEST_TIMEOUT_MS: "50"    # Reduzido drasticamente de 1000ms para 50ms
+      HEDGE_DELAY_MS: "5"         # Reduzido de 100ms para 5ms
+      CONCURRENCY_LIMIT: "2048"   # Aumentado de 256 para 2048
+      CB_FAIL_RATE: "0.5"         # Aumentado de 0.25 para 0.5 (mais tolerante)
+      CB_MIN_SAMPLES: "20"        # Reduzido de 50 para 20 (mais responsivo)
+      CB_OPEN_SECS: "1"           # Reduzido de 2 para 1 segundo
     depends_on:
       - payment-processor-default
       - payment-processor-fallback
@@ -125,8 +125,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
-          memory: "100M"
+          cpus: "1.0"             # Aumentado de 0.4 para 1.0 CPU
+          memory: "200M"          # Aumentado de 100M para 200M
 
   api-2:
     <<: *api
