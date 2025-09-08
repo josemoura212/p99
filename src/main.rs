@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     routing::{get, post},
 };
@@ -78,15 +78,25 @@ struct PayOut {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PaymentSummary {
     default: ProcessorSummary,
     fallback: ProcessorSummary,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ProcessorSummary {
     total_requests: u64,
     total_amount: f64,
+}
+
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct PaymentsSummaryQuery {
+    from: Option<String>,
+    to: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -153,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/payments", post(pay))
         .route("/payments-summary", get(payments_summary))
+        .route("/purge-payments", post(purge_payments))
         .route("/clientes/{id}/transacoes", post(transacao))
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
@@ -208,14 +219,12 @@ async fn pay(
     };
 
     // payload para upstream (formato da rinha)
-    let requested_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = std::time::SystemTime::now();
+    let requested_at = chrono::DateTime::<chrono::Utc>::from(now).to_rfc3339();
     let req_body = serde_json::json!({
-        "correlationId": body.correlation_id,
+        "correlationId": uuid::Uuid::new_v4().to_string(),
         "amount": body.amount,
-        "requestedAt": format!("2025-09-07T{:02}:00:00.000Z", requested_at % 86400 / 3600),
+        "requestedAt": requested_at,
     });
 
     let start = std::time::Instant::now();
@@ -348,24 +357,13 @@ async fn transacao(
     // e usar o upstream mock para processamento
 
     // Chamar upstream para processamento (usando o mesmo mecanismo)
-    let correlation_id = format!(
-        "transacao-{}-{}",
-        cliente_id,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let correlation_id = uuid::Uuid::new_v4().to_string();
 
     let req_body = serde_json::json!({
         "correlationId": correlation_id,
         "amount": body.valor as f64,
-        "clienteId": cliente_id_num,
-        "tipo": body.tipo,
-        "descricao": body.descricao
-    });
-
-    // Usar o mesmo mecanismo de upstream da função pay
+        "requestedAt": chrono::Utc::now().to_rfc3339()
+    }); // Usar o mesmo mecanismo de upstream da função pay
     let (prim, sec, prim_brk) = if st.strategy.pick_a_first(&st.breaker_a, &st.breaker_b) {
         (&st.up_a, &st.up_b, &st.breaker_a)
     } else {
@@ -439,6 +437,7 @@ async fn transacao(
 
 async fn payments_summary(
     State(st): State<AppState>,
+    _query: Query<PaymentsSummaryQuery>,
 ) -> Result<Json<PaymentSummary>, (StatusCode, String)> {
     let stats = st.stats.lock().unwrap();
     Ok(Json(PaymentSummary {
@@ -451,4 +450,13 @@ async fn payments_summary(
             total_amount: stats.fallback.total_amount,
         },
     }))
+}
+
+async fn purge_payments(State(st): State<AppState>) -> Result<StatusCode, (StatusCode, String)> {
+    let mut stats = st.stats.lock().unwrap();
+    stats.default.total_requests = 0;
+    stats.default.total_amount = 0.0;
+    stats.fallback.total_requests = 0;
+    stats.fallback.total_amount = 0.0;
+    Ok(StatusCode::OK)
 }

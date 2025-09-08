@@ -26,6 +26,7 @@ impl UpstreamClient {
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_nodelay(true)
+            .use_rustls_tls()
             .connect_timeout(Duration::from_millis(25))
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .build()?;
@@ -37,18 +38,45 @@ impl UpstreamClient {
 
     pub async fn request(
         &self,
-        _cfg: Arc<Cfg>,
-        _body: Value,
+        cfg: Arc<Cfg>,
+        body: Value,
     ) -> Result<(String, Value), (String, http::StatusCode, String)> {
-        // Simular processamento sem fazer requisição externa por enquanto
-        // TODO: Reativar quando resolver problemas de conectividade
-        tokio::time::sleep(Duration::from_millis(10)).await; // Simular latência
+        let base = if self.name == "A" {
+            &cfg.upstream_a
+        } else {
+            &cfg.upstream_b
+        };
+        let url = format!("{base}{}", cfg.pay_path);
 
-        Ok((
-            self.name.clone(),
-            serde_json::json!({
-                "message": "payment processed successfully"
-            }),
-        ))
+        let mut req = self.http.post(&url).json(&body);
+        if let (Some(hn), Some(hv)) = (&cfg.auth_header_name, &cfg.auth_header_value) {
+            req = req.header(hn, hv);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let sc = resp.status();
+                if sc.is_success() {
+                    // Para mock, simular resposta de sucesso da rinha
+                    Ok((
+                        self.name.clone(),
+                        serde_json::json!({
+                            "message": "payment processed successfully"
+                        }),
+                    ))
+                } else {
+                    Err((
+                        self.name.clone(),
+                        sc,
+                        format!("upstream {} returned {}", self.name, sc),
+                    ))
+                }
+            }
+            Err(e) => Err((
+                self.name.clone(),
+                http::StatusCode::BAD_GATEWAY,
+                format!("upstream {} error: {e}", self.name),
+            )),
+        }
     }
 }

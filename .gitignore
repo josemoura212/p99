@@ -1,1 +1,28 @@
+# Rust
 /target
+Cargo.lock
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.log
+report.html
+performance-test.js
+debug-test.js
+simple-test.js
+test-load.js
+
+# Temporary files
+*.tmp
+*.bak
+
+# Docker
+docker-compose.override.yml

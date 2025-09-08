@@ -14,7 +14,13 @@ Este projeto foi adaptado para participar da **Rinha de Backend 2025**, implemen
 
 ## 🚀 Como Executar
 
-### 1. Subir os Serviços
+### 1. Clonando o Repositório
+```bash
+git clone https://github.com/josemoura212/p99.git
+cd p99
+```
+
+### 2. Subir os Serviços
 ```bash
 # Construir e subir todos os serviços
 docker-compose up --build -d
@@ -23,7 +29,7 @@ docker-compose up --build -d
 docker-compose ps
 ```
 
-### 2. Testar Endpoints
+### 3. Testar Endpoints
 ```bash
 # Health check
 curl http://localhost:9999/healthz
@@ -41,13 +47,24 @@ curl http://localhost:9999/payments-summary
 curl http://localhost:9999/metrics
 ```
 
-### 3. Executar Teste de Carga
+### 4. Executar Testes Oficiais da Rinha
 ```bash
 # Instalar k6 (se não tiver)
 sudo apt update && sudo apt install -y k6
 
-# Executar teste
-k6 run test-load.js
+# Entrar no diretório de testes da Rinha
+cd rinha-de-backend-2025/rinha-test
+
+# Executar teste oficial (versão compatível)
+k6 run rinha-fixed.js
+
+# Ou executar com dashboard
+export K6_WEB_DASHBOARD=true
+export K6_WEB_DASHBOARD_PORT=5665
+export K6_WEB_DASHBOARD_PERIOD=2s
+export K6_WEB_DASHBOARD_OPEN=true
+export K6_WEB_DASHBOARD_EXPORT='report.html'
+k6 run rinha-fixed.js
 ```
 
 ## 📋 Endpoints Disponíveis
@@ -138,6 +155,27 @@ cargo build --release
 UPSTREAM_A_URL=http://localhost:8001 \
 UPSTREAM_B_URL=http://localhost:8002 \
 cargo run
+```
+
+### Fazer Commit das Mudanças
+```bash
+# Verificar status
+git status
+
+# Adicionar arquivos modificados
+git add .
+
+# Fazer commit
+git commit -m "feat: implementar load balancer para Rinha de Backend 2025
+
+- Adicionar endpoint /payments com circuit breaker
+- Implementar estratégia de hedging
+- Adicionar endpoint /payments-summary para auditoria
+- Configurar Docker Compose com payment processors
+- Otimizar performance com MiMalloc e HTTP/2"
+
+# Enviar para repositório
+git push origin main
 ```
 
 ## 📝 Notas Técnicas
